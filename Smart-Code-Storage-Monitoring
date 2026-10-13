@@ -1,0 +1,213 @@
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <DHT.h>
+#include <Servo.h>
+#include <SoftwareSerial.h>
+
+// -------- PIN CONFIGURATION --------
+#define DHTPIN 5
+#define DHTTYPE DHT11
+
+#define SERVO_PIN 6
+#define BUZZER_PIN 4
+#define FAULT_PIN 7
+#define WATER_PIN A0
+
+// SIM800L TX -> Arduino D2
+// SIM800L RX <- Arduino D3 through voltage divider
+SoftwareSerial sim800(2, 3);
+
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+DHT dht(DHTPIN, DHTTYPE);
+Servo coolingServo;
+
+// Replace with your real mobile number
+const char PHONE_NUMBER[] = "+91XXXXXXXXXX";
+
+bool simReady = false;
+
+bool tempAlertSent = false;
+bool waterAlertSent = false;
+bool sensorAlertSent = false;
+bool faultAlertSent = false;
+
+unsigned long lastSMSAttempt = 0;
+const unsigned long SMS_INTERVAL = 15000;
+
+// -------- SMS FUNCTION --------
+void sendSMS(const char *message) {
+  if (millis() - lastSMSAttempt < SMS_INTERVAL) {
+    Serial.println("SMS cooldown active");
+    return;
+  }
+
+  lastSMSAttempt = millis();
+
+  Serial.println("Sending SMS...");
+
+  sim800.println("AT+CMGF=1");
+  delay(1000);
+
+  sim800.print("AT+CMGS=\"");
+  sim800.print(PHONE_NUMBER);
+  sim800.println("\"");
+  delay(1000);
+
+  sim800.print(message);
+  delay(500);
+
+  sim800.write(26);  // Ctrl+Z
+  delay(5000);
+
+  Serial.println("SMS command sent. Check phone.");
+}
+
+// -------- SETUP --------
+void setup() {
+  Serial.begin(9600);
+  sim800.begin(9600);
+
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(FAULT_PIN, INPUT_PULLUP);
+
+  digitalWrite(BUZZER_PIN, LOW);
+
+  dht.begin();
+
+  coolingServo.attach(SERVO_PIN);
+  coolingServo.write(90);
+
+  lcd.init();
+  lcd.backlight();
+
+  lcd.setCursor(0, 0);
+  lcd.print("Cold Storage");
+  lcd.setCursor(0, 1);
+  lcd.print("System Starting");
+
+  delay(2000);
+  lcd.clear();
+
+  Serial.println("Cold Storage Monitoring Started");
+  Serial.println("Checking SIM800L...");
+
+  sim800.println("AT");
+  delay(1500);
+
+  while (sim800.available()) {
+    Serial.write(sim800.read());
+  }
+
+  Serial.println();
+  Serial.println("System Ready");
+}
+
+// -------- MAIN LOOP --------
+void loop() {
+  float temperature = dht.readTemperature();
+  int waterValue = analogRead(WATER_PIN);
+
+  bool sensorError = isnan(temperature);
+  bool wireFault = (digitalRead(FAULT_PIN) == HIGH);
+  bool waterAlert = (waterValue >= 500);
+  bool temperatureAlert =
+      (!sensorError && temperature >= 12.0);
+
+  Serial.println("--------------------");
+
+  if (sensorError) {
+    Serial.println("DHT11 SENSOR ERROR");
+
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("SENSOR ERROR");
+
+    digitalWrite(BUZZER_PIN, HIGH);
+
+    if (!sensorAlertSent) {
+      sendSMS("ALERT: DHT11 sensor error.");
+      sensorAlertSent = true;
+    }
+  } else {
+    sensorAlertSent = false;
+
+    Serial.print("Temperature: ");
+    Serial.print(temperature);
+    Serial.println(" C");
+
+    lcd.setCursor(0, 0);
+    lcd.print("Temp: ");
+    lcd.print(temperature);
+    lcd.print(" C   ");
+
+    if (temperature >= 12.0) {
+      coolingServo.write(30);
+
+      lcd.setCursor(0, 1);
+      lcd.print("TEMP HIGH ALERT ");
+
+      digitalWrite(BUZZER_PIN, HIGH);
+
+      if (!tempAlertSent) {
+        sendSMS("ALERT: Storage temperature HIGH.");
+        tempAlertSent = true;
+      }
+    } else if (temperature <= 8.0) {
+      coolingServo.write(150);
+
+      lcd.setCursor(0, 1);
+      lcd.print("TEMP LOW        ");
+
+      tempAlertSent = false;
+    } else {
+      coolingServo.write(90);
+
+      lcd.setCursor(0, 1);
+      lcd.print("TEMP NORMAL     ");
+
+      tempAlertSent = false;
+    }
+  }
+
+  Serial.print("Water sensor value: ");
+  Serial.println(waterValue);
+
+  if (waterAlert) {
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("WATER LEVEL HIGH");
+
+    digitalWrite(BUZZER_PIN, HIGH);
+
+    if (!waterAlertSent) {
+      sendSMS("ALERT: Water level is HIGH.");
+      waterAlertSent = true;
+    }
+  } else {
+    waterAlertSent = false;
+  }
+
+  if (wireFault) {
+    Serial.println("SYSTEM FAULT: Wire disconnected");
+
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("SYSTEM FAULT");
+
+    digitalWrite(BUZZER_PIN, HIGH);
+
+    if (!faultAlertSent) {
+      sendSMS("ALERT: System fault wire disconnected.");
+      faultAlertSent = true;
+    }
+  } else {
+    faultAlertSent = false;
+  }
+
+  if (!sensorError && !waterAlert && !wireFault &&
+      !temperatureAlert) {
+    digitalWrite(BUZZER_PIN, LOW);
+  }
+
+  delay(2000);
+}
